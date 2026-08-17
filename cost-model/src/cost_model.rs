@@ -233,6 +233,10 @@ impl CostModel {
             | SystemInstruction::AuthorizeNonceAccount(..)
             | SystemInstruction::UpgradeNonceAccount
             | SystemInstruction::AssignWithSeed { .. }
+            | SystemInstruction::DeriveAccount { ..}
+            | SystemInstruction::InitializeRoot {..}
+            | SystemInstruction::RevokeChildAccount{..}
+            | SystemInstruction::ReclaimAccount{..}
             | SystemInstruction::TransferWithSeed { .. } => SystemProgramAccountAllocation::None,
             // DEVELOPER WARNING: New non-allocating instructions MUST return `Failed`
             // until activated by a feature gate

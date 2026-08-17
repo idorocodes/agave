@@ -229,6 +229,7 @@ pub fn parse_system(
                 })
             }
         }
+        _ => todo!(),
     }
 }
 

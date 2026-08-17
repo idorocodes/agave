@@ -1,7 +1,10 @@
 use {
-    crate::system_instruction::{
-        advance_nonce_account, authorize_nonce_account, initialize_nonce_account,
-        withdraw_nonce_account,
+    crate::{
+        derived_account::DerivedAccountState,
+        system_instruction::{
+            advance_nonce_account, authorize_nonce_account, initialize_nonce_account,
+            withdraw_nonce_account,
+        },
     },
     log::*,
     solana_bincode::limited_deserialize,
@@ -146,6 +149,231 @@ fn allocate_and_assign(
     assign(to, to_address, owner, signers, invoke_context)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn derive_account(
+    from_account_index: IndexOfAccount,
+    parent_account_index: IndexOfAccount,
+    to_account_index: IndexOfAccount,
+    to_address: &Address,
+    lamports: u64,
+    space: u64,
+    _owner: &Pubkey,
+    signers: &HashSet<Pubkey>,
+    invoke_context: &InvokeContext,
+    instruction_context: &InstructionContext,
+) -> Result<(), InstructionError> {
+    // Step 1: read and validate the parent, get its depth + current children_count
+    let (parent_pubkey, parent_depth, parent_children_count) = {
+        let parent = instruction_context.try_borrow_instruction_account(parent_account_index)?;
+
+        if parent.get_owner() != &system_program::id() {
+            ic_msg!(
+                invoke_context,
+                "DeriveAccount: parent not owned by system program"
+            );
+            return Err(InstructionError::InvalidAccountOwner);
+        }
+
+        let parent_state: DerivedAccountState = parent.get_state()?;
+
+        if parent_state.revoked {
+            ic_msg!(invoke_context, "DeriveAccount: parent account is revoked");
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        let parent_key =
+            *instruction_context.get_key_of_instruction_account(parent_account_index)?;
+        if !signers.contains(&parent_key) {
+            ic_msg!(
+                invoke_context,
+                "DeriveAccount: parent {:?} must sign",
+                parent_key
+            );
+            return Err(InstructionError::MissingRequiredSignature);
+        }
+
+        (parent_key, parent_state.depth, parent_state.children_count)
+    };
+
+    // Step 2: create the child account (same as create_account's flow)
+    {
+        let mut to = instruction_context.try_borrow_instruction_account(to_account_index)?;
+        if to.get_lamports() > 0 {
+            ic_msg!(
+                invoke_context,
+                "DeriveAccount: account {:?} already in use",
+                to_address
+            );
+            return Err(SystemError::AccountAlreadyInUse.into());
+        }
+
+        allocate(&mut to, to_address, space, signers, invoke_context)?;
+
+        let child_state = DerivedAccountState {
+            parent: parent_pubkey,
+            depth: parent_depth.saturating_add(1),
+            children_count: 0,
+            recovery_authority: None,
+            revoked: false,
+        };
+
+        to.set_state(&child_state)?;
+    }
+
+    // Step 3: update the parent's children_count now that the child exists
+    {
+        let mut parent =
+            instruction_context.try_borrow_instruction_account(parent_account_index)?;
+        let mut parent_state: DerivedAccountState = parent.get_state()?;
+        parent_state.children_count = parent_children_count.saturating_add(1);
+        parent.set_state(&parent_state)?;
+    }
+
+    // Step 4: move lamports from payer to the new child
+    transfer(
+        from_account_index,
+        to_account_index,
+        lamports,
+        invoke_context,
+        instruction_context,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn initialize_root(
+    from_account_index: IndexOfAccount,
+    to_account_index: IndexOfAccount,
+    to_address: &Address,
+    lamports: u64,
+    space: u64,
+    recovery_authority: Option<Pubkey>,
+    signers: &HashSet<Pubkey>,
+    invoke_context: &InvokeContext,
+    instruction_context: &InstructionContext,
+) -> Result<(), InstructionError> {
+    {
+        let mut to = instruction_context.try_borrow_instruction_account(to_account_index)?;
+        if to.get_lamports() > 0 {
+            ic_msg!(
+                invoke_context,
+                "InitializeRoot: account {:?} already in use",
+                to_address
+            );
+            return Err(SystemError::AccountAlreadyInUse.into());
+        }
+
+        allocate(&mut to, to_address, space, signers, invoke_context)?;
+
+        let root_state = DerivedAccountState {
+            parent: Pubkey::default(),
+            depth: 0,
+            children_count: 0,
+            recovery_authority,
+            revoked: false,
+        };
+
+        to.set_state(&root_state)?;
+    }
+
+    transfer(
+        from_account_index,
+        to_account_index,
+        lamports,
+        invoke_context,
+        instruction_context,
+    )
+}
+fn reclaim_account(
+    recovery_authority_account_index: IndexOfAccount,
+    child_account_index: IndexOfAccount,
+    destination_account_index: IndexOfAccount,
+    signers: &HashSet<Pubkey>,
+    invoke_context: &InvokeContext,
+    instruction_context: &InstructionContext,
+) -> Result<(), InstructionError> {
+    let recovery_authority_key =
+        *instruction_context.get_key_of_instruction_account(recovery_authority_account_index)?;
+
+    if !signers.contains(&recovery_authority_key) {
+        ic_msg!(
+            invoke_context,
+            "ReclaimAccount: recovery authority {:?} must sign",
+            recovery_authority_key
+        );
+        return Err(InstructionError::MissingRequiredSignature);
+    }
+
+    {
+        let child = instruction_context.try_borrow_instruction_account(child_account_index)?;
+        let child_state: DerivedAccountState = child.get_state()?;
+
+        if !child_state.revoked {
+            ic_msg!(invoke_context, "ReclaimAccount: account is not revoked");
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        if child_state.recovery_authority != Some(recovery_authority_key) {
+            ic_msg!(invoke_context, "ReclaimAccount: signer is not the recovery authority");
+            return Err(InstructionError::InvalidArgument);
+        }
+    }
+
+    let lamports = {
+        let child = instruction_context.try_borrow_instruction_account(child_account_index)?;
+        child.get_lamports()
+    };
+
+    {
+        let mut child = instruction_context.try_borrow_instruction_account(child_account_index)?;
+        child.set_data_length(0)?;
+        child.checked_sub_lamports(lamports)?;
+    }
+
+    {
+        let mut destination =
+            instruction_context.try_borrow_instruction_account(destination_account_index)?;
+        destination.checked_add_lamports(lamports)?;
+    }
+
+    Ok(())
+}
+
+fn revoke_child_account(
+    parent_account_index: IndexOfAccount,
+    child_account_index: IndexOfAccount,
+    signers: &HashSet<Pubkey>,
+    invoke_context: &InvokeContext,
+    instruction_context: &InstructionContext,
+) -> Result<(), InstructionError> {
+    let parent_key = *instruction_context.get_key_of_instruction_account(parent_account_index)?;
+
+    if !signers.contains(&parent_key) {
+        ic_msg!(
+            invoke_context,
+            "RevokeChildAccount: parent {:?} must sign",
+            parent_key
+        );
+        return Err(InstructionError::MissingRequiredSignature);
+    }
+
+    let mut child = instruction_context.try_borrow_instruction_account(child_account_index)?;
+    let mut child_state: DerivedAccountState = child.get_state()?;
+
+    if child_state.parent != parent_key {
+        ic_msg!(
+            invoke_context,
+            "RevokeChildAccount: account is not a child of the given parent"
+        );
+        return Err(InstructionError::InvalidArgument);
+    }
+
+    if child_state.revoked {
+        // already revoked, nothing to do
+        return Ok(());
+    }
+
+    child_state.revoked = true;
+    child.set_state(&child_state)
+}
 #[allow(clippy::too_many_arguments)]
 fn create_account(
     from_account_index: IndexOfAccount,
@@ -407,6 +635,13 @@ declare_process_instruction!(Entrypoint, DEFAULT_COMPUTE_UNITS, |invoke_context|
                 &instruction_context,
             )
         }
+        SystemInstruction::ReclaimAccount => {
+            instruction_context.check_number_of_instruction_accounts(3)?;
+            // account 0 = recovery_authority (signer)
+            // account 1 = child (revoked account being closed)
+            // account 2 = destination
+            reclaim_account(0, 1, 2, &signers, invoke_context, &instruction_context)
+        } 
         SystemInstruction::AdvanceNonceAccount => {
             instruction_context.check_number_of_instruction_accounts(1)?;
             let mut me = instruction_context.try_borrow_instruction_account(0)?;
@@ -526,6 +761,69 @@ declare_process_instruction!(Entrypoint, DEFAULT_COMPUTE_UNITS, |invoke_context|
                 invoke_context,
             )?;
             assign(&mut account, &address, &owner, &signers, invoke_context)
+        }
+        SystemInstruction::DeriveAccount {
+            parent,
+            seed,
+            lamports,
+            space,
+            owner,
+        } => {
+            instruction_context.check_number_of_instruction_accounts(3)?;
+            // account 0 = from (payer)
+            // account 1 = parent
+            // account 2 = to (new child)
+            let to_address = Address::create(
+                instruction_context.get_key_of_instruction_account(2)?,
+                Some((&parent, &seed, &owner)),
+                invoke_context,
+            )?;
+            derive_account(
+                0,
+                1,
+                2,
+                &to_address,
+                lamports,
+                space,
+                &owner,
+                &signers,
+                invoke_context,
+                &instruction_context,
+            )
+        }
+
+        SystemInstruction::RevokeChildAccount => {
+            instruction_context.check_number_of_instruction_accounts(2)?;
+            // account 0 = parent
+            // account 1 = child
+            revoke_child_account(0, 1, &signers, invoke_context, &instruction_context)
+        }
+
+        SystemInstruction::InitializeRoot {
+            lamports,
+            space,
+            owner: _,
+            recovery_authority,
+        } => {
+            instruction_context.check_number_of_instruction_accounts(2)?;
+            // account 0 = from (payer)
+            // account 1 = to (new root)
+            let to_address = Address::create(
+                instruction_context.get_key_of_instruction_account(1)?,
+                None,
+                invoke_context,
+            )?;
+            initialize_root(
+                0,
+                1,
+                &to_address,
+                lamports,
+                space,
+                recovery_authority,
+                &signers,
+                invoke_context,
+                &instruction_context,
+            )
         }
         SystemInstruction::CreateAccountAllowPrefund {
             lamports,
@@ -2251,5 +2549,356 @@ mod tests {
             vec![AccountMeta::new(to, false), AccountMeta::new(from, true)],
             Err(InstructionError::MissingRequiredSignature),
         );
+    }
+
+    #[test]
+    fn test_derive_account() {
+        let new_owner = Pubkey::from([9; 32]);
+        let from = Pubkey::new_unique();
+        let parent = Pubkey::new_unique();
+        let seed = "pool-a";
+        let to = Pubkey::create_with_seed(&parent, seed, &new_owner).unwrap();
+
+        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+
+        let parent_state = DerivedAccountState {
+            parent: Pubkey::default(),
+            depth: 0,
+            children_count: 0,
+            recovery_authority: None,
+            revoked: false,
+        };
+        let mut parent_account = AccountSharedData::new(10, 0, &system_program::id());
+        parent_account.set_data_from_slice(&bincode::serialize(&parent_state).unwrap());
+
+        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+
+        let accounts = process_instruction(
+            &bincode::serialize(&SystemInstruction::DeriveAccount {
+                parent,
+                seed: seed.to_string(),
+                lamports: 50,
+                space: 64,
+                owner: new_owner,
+            })
+            .unwrap(),
+            vec![
+                (from, from_account),
+                (parent, parent_account),
+                (to, to_account),
+            ],
+            vec![
+                AccountMeta {
+                    pubkey: from,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: parent,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: to,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            Ok(()),
+        );
+
+        assert_eq!(accounts[0].lamports(), 50);
+        assert_eq!(accounts[2].lamports(), 50);
+        assert_eq!(accounts[2].owner(), &system_program::id()); // <-- changed
+
+        let child_state: DerivedAccountState = bincode::deserialize(accounts[2].data()).unwrap();
+        assert_eq!(child_state.parent, parent);
+        assert_eq!(child_state.depth, 1);
+        assert_eq!(child_state.children_count, 0);
+        assert!(!child_state.revoked);
+
+        let updated_parent_state: DerivedAccountState =
+            bincode::deserialize(accounts[1].data()).unwrap();
+        assert_eq!(updated_parent_state.children_count, 1);
+    }
+    #[test]
+    fn test_derive_account_seed_mismatch_fails() {
+        let new_owner = Pubkey::from([9; 32]);
+        let from = Pubkey::new_unique();
+        let parent = Pubkey::new_unique();
+        // 'to' does NOT match create_with_seed(parent, seed, owner)
+        let to = Pubkey::new_unique();
+
+        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let parent_state = DerivedAccountState {
+            parent: Pubkey::default(),
+            depth: 0,
+            children_count: 0,
+            recovery_authority: None,
+            revoked: false,
+        };
+        let mut parent_account = AccountSharedData::new(10, 0, &new_owner);
+        parent_account.set_data_from_slice(&bincode::serialize(&parent_state).unwrap());
+        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+
+        process_instruction(
+            &bincode::serialize(&SystemInstruction::DeriveAccount {
+                parent,
+                seed: "pool-a".to_string(),
+                lamports: 50,
+                space: 64,
+                owner: new_owner,
+            })
+            .unwrap(),
+            vec![
+                (from, from_account),
+                (parent, parent_account),
+                (to, to_account),
+            ],
+            vec![
+                AccountMeta {
+                    pubkey: from,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: parent,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: to,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            Err(SystemError::AddressWithSeedMismatch.into()),
+        );
+    }
+
+    #[test]
+    fn test_derive_account_parent_not_signed() {
+        let new_owner = Pubkey::from([9; 32]);
+        let from = Pubkey::new_unique();
+        let parent = Pubkey::new_unique();
+        let seed = "pool-a";
+        let to = Pubkey::create_with_seed(&parent, seed, &new_owner).unwrap();
+
+        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let parent_state = DerivedAccountState {
+            parent: Pubkey::default(),
+            depth: 0,
+            children_count: 0,
+            recovery_authority: None,
+            revoked: false,
+        };
+        let mut parent_account = AccountSharedData::new(10, 0, &system_program::id());
+        parent_account.set_data_from_slice(&bincode::serialize(&parent_state).unwrap());
+        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+
+        process_instruction(
+            &bincode::serialize(&SystemInstruction::DeriveAccount {
+                parent,
+                seed: seed.to_string(),
+                lamports: 50,
+                space: 64,
+                owner: new_owner,
+            })
+            .unwrap(),
+            vec![
+                (from, from_account),
+                (parent, parent_account),
+                (to, to_account),
+            ],
+            vec![
+                AccountMeta {
+                    pubkey: from,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: parent,
+                    is_signer: false,
+                    is_writable: true,
+                }, // not signed
+                AccountMeta {
+                    pubkey: to,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            Err(InstructionError::MissingRequiredSignature),
+        );
+    }
+    #[test]
+    fn test_initialize_root() {
+        let from = Pubkey::new_unique();
+        let root = Pubkey::new_unique();
+
+        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let root_account = AccountSharedData::new(0, 0, &Pubkey::default());
+
+        let accounts = process_instruction(
+            &bincode::serialize(&SystemInstruction::InitializeRoot {
+                lamports: 50,
+                space: 64,
+                owner: Pubkey::from([9; 32]),
+                recovery_authority: None,
+            })
+            .unwrap(),
+            vec![(from, from_account), (root, root_account)],
+            vec![
+                AccountMeta {
+                    pubkey: from,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: root,
+                    is_signer: true,
+                    is_writable: true,
+                },
+            ],
+            Ok(()),
+        );
+
+        assert_eq!(accounts[0].lamports(), 50);
+        assert_eq!(accounts[1].lamports(), 50);
+        assert_eq!(accounts[1].owner(), &system_program::id());
+
+        let root_state: DerivedAccountState = bincode::deserialize(accounts[1].data()).unwrap();
+        assert_eq!(root_state.parent, Pubkey::default());
+        assert_eq!(root_state.depth, 0);
+        assert_eq!(root_state.children_count, 0);
+        assert!(!root_state.revoked);
+    }
+    #[test]
+    fn test_reclaim_account() {
+        let recovery_authority = Pubkey::new_unique();
+        let child = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+    
+        let child_state = DerivedAccountState {
+            parent: Pubkey::new_unique(),
+            depth: 1,
+            children_count: 0,
+            recovery_authority: Some(recovery_authority),
+            revoked: true,
+        };
+        let mut child_account = AccountSharedData::new(50, 0, &system_program::id());
+        child_account.set_data_from_slice(&bincode::serialize(&child_state).unwrap());
+    
+        let recovery_authority_account = AccountSharedData::new(0, 0, &system_program::id());
+        let destination_account = AccountSharedData::new(0, 0, &system_program::id());
+    
+        let accounts = process_instruction(
+            &bincode::serialize(&SystemInstruction::ReclaimAccount).unwrap(),
+            vec![
+                (recovery_authority, recovery_authority_account),
+                (child, child_account),
+                (destination, destination_account),
+            ],
+            vec![
+                AccountMeta { pubkey: recovery_authority, is_signer: true, is_writable: false },
+                AccountMeta { pubkey: child, is_signer: false, is_writable: true },
+                AccountMeta { pubkey: destination, is_signer: false, is_writable: true },
+            ],
+            Ok(()),
+        );
+    
+        assert_eq!(accounts[1].lamports(), 0);
+        assert_eq!(accounts[2].lamports(), 50);
+    }
+    #[test]
+    fn test_derive_account_revoked_parent_fails() {
+        let new_owner = Pubkey::from([9; 32]);
+        let from = Pubkey::new_unique();
+        let parent = Pubkey::new_unique();
+        let seed = "pool-a";
+        let to = Pubkey::create_with_seed(&parent, seed, &new_owner).unwrap();
+
+        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let parent_state = DerivedAccountState {
+            parent: Pubkey::default(),
+            depth: 0,
+            children_count: 0,
+            recovery_authority: None,
+            revoked: true, // revoked
+        };
+        let mut parent_account = AccountSharedData::new(10, 0, &system_program::id());
+        parent_account.set_data_from_slice(&bincode::serialize(&parent_state).unwrap());
+        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+
+        process_instruction(
+            &bincode::serialize(&SystemInstruction::DeriveAccount {
+                parent,
+                seed: seed.to_string(),
+                lamports: 50,
+                space: 64,
+                owner: new_owner,
+            })
+            .unwrap(),
+            vec![
+                (from, from_account),
+                (parent, parent_account),
+                (to, to_account),
+            ],
+            vec![
+                AccountMeta {
+                    pubkey: from,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: parent,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: to,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            Err(InstructionError::InvalidArgument),
+        );
+    }
+    #[test]
+    fn test_revoke_child_account() {
+        let parent = Pubkey::new_unique();
+        let child = Pubkey::new_unique();
+
+        let parent_account = AccountSharedData::new(10, 0, &system_program::id());
+        let child_state = DerivedAccountState {
+            parent,
+            depth: 1,
+            children_count: 0,
+            recovery_authority: None,
+            revoked: false,
+        };
+        let mut child_account = AccountSharedData::new(10, 0, &system_program::id());
+        child_account.set_data_from_slice(&bincode::serialize(&child_state).unwrap());
+
+        let accounts = process_instruction(
+            &bincode::serialize(&SystemInstruction::RevokeChildAccount).unwrap(),
+            vec![(parent, parent_account), (child, child_account)],
+            vec![
+                AccountMeta {
+                    pubkey: parent,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: child,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            Ok(()),
+        );
+
+        let updated_child_state: DerivedAccountState =
+            bincode::deserialize(accounts[1].data()).unwrap();
+        assert!(updated_child_state.revoked);
     }
 }

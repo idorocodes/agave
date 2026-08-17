@@ -2,7 +2,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 pub mod system_instruction;
 pub mod system_processor;
-
+pub mod derived_account;
 use solana_sdk_ids::system_program;
 pub use {
     solana_nonce_account::{SystemAccountKind, get_system_account_kind},

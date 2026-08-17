@@ -576,7 +576,7 @@ mod test {
         let versions = nonce_account.get_state::<Versions>().unwrap();
         assert_eq!(versions.state(), &State::Uninitialized);
         assert_eq!(nonce_account.get_lamports(), expect_from_lamports);
-        assert_eq!(to_account.get_lamports(), expect_to_lamports);
+        assert_eq!(to_account.get_lamports(), expect_to_lamports)
     }
 
     #[test]
